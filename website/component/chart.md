@@ -615,12 +615,23 @@ LineChart::new(data)
 | --- | --- |
 | `LineChart`, `AreaChart` | A crosshair and a dot per series glide along the line to the hovered point; the dot grows a halo. |
 | `BarChart` | A highlight band the width of a bar slides to the hovered bar, and the other bars fade behind it. |
-| `PieChart` | The hovered slice lifts out of the ring and the others fade; the tooltip shows the value and its share. |
+| `PieChart` | The hovered slice lifts out of the ring and the others fade; the tooltip shows the value and its share, via `value_label` if one is set. |
 | `RadarChart` | A dot per series glides along the polygon to the hovered spoke. |
 | `CandlestickChart` | A highlight band slides to the hovered candle; the tooltip lists open, high, low and close. |
 | `SankeyChart` | The links of the hovered node keep their color while the rest fade; the tooltip shows the node's label and throughput. |
 
 The tooltip box follows the cursor, flipping toward the center of the plot near each edge. `AreaChart` and `RadarChart` take one `.name()` per series, called after the matching `.y()` / `.value()`.
+
+`PieChart::tooltip_title` names the slice under the cursor. `label` supplies the title when it is unset, but it also draws the leader-line labels around the ring, so a pie that names its slices in a legend beside it needs this to say which slice the tooltip is about.
+
+`PieChart::value_label` replaces the text of its row, which the default writes as the raw value and its share. Set it wherever the raw number is not what a reader should see — a value that is already a ratio reads as `0.35 (35.0%)` otherwise, and a chart drawn from adjusted values, such as a floor that keeps a hairline slice visible, would report the adjustment as though it were the datum:
+
+```rust
+PieChart::new(holdings)
+    .value(|d| d.ratio.max(MIN_VISIBLE))     // Drawn with a floor
+    .tooltip_title(|d| d.name.clone())       // Named without leader lines
+    .value_label(|d, _, _| pct(d.ratio))     // Read as it truly is
+```
 
 ### Identity
 
@@ -632,13 +643,24 @@ shares.iter().enumerate().map(|(i, share)| PieChart::new(share.clone()).id(("sha
 
 A `GlobalElementId` is the whole id stack, so siblings that already carry an id of their own — rows drawn by `List` or `uniform_list`, say — separate the charts beneath them without help.
 
+### Turning it off
+
+`interactive(false)` takes the whole layer away, hitbox included, the way Highcharts' `enableMouseTracking` or ECharts' `silent` does. Reach for it in two places: a chart that only decorates, and a chart something else is drawn over:
+
+```rust
+AreaChart::new(placeholder).interactive(false) // A skeleton, a thumbnail
+AreaChart::new(range).interactive(false)       // A backdrop under drag handles
+```
+
+The second matters because a plain hitbox does not block the one behind it: an element painted over an interactive chart is hovered *and so is the chart*, so the crosshair keeps tracking under it. The chart has to stand down.
+
 ### Motion
 
 The emphasis is animated with the styled layer's motion tokens (`cx.theme().motion_tokens()`): pointers — crosshair, band, dots — follow the hovered datum on a fast spring, a pie slice lifts on the control spring, and the whole overlay fades in when the cursor lands on a datum and out after it leaves. The motion honors the operating system's reduced-motion preference, under which every value adopts its target at once.
 
 ### Caching
 
-A chart also keeps its heavy geometry across frames, since it repaints on every frame it is on screen: line and area strokes and pie slices stay tessellated while their projected points are unchanged, and a sankey diagram keeps its placement while its data, settings and size are unchanged. This cache hangs off the same id, so charts sharing one share the cache and thrash it — another reason to name siblings apart.
+A chart also keeps its heavy geometry across frames, since it repaints on every frame it is on screen: line and area strokes and pie slices stay tessellated while their projected points are unchanged, and a sankey diagram keeps its placement while its data, settings and size are unchanged. This cache hangs off the same id, so charts sharing one share the cache and thrash it — another reason to name siblings apart — and a chart with `interactive(false)`, having no id of its own, rebuilds its geometry on each paint.
 
 ### Custom Plots
 

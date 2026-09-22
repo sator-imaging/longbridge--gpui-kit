@@ -130,6 +130,7 @@ pub struct SankeyChart<T: 'static> {
     min_link_width: f32,
     label_gap: f32,
     id: ElementId,
+    interactive: bool,
     /// The placement for this frame, resolved in `prepaint` (measuring labels
     /// needs the window) and read by `tooltip_state` and `paint`.
     frame: Option<Rc<SankeyFrame>>,
@@ -162,6 +163,7 @@ impl<T> SankeyChart<T> {
             min_link_width: DEFAULT_MIN_LINK_WIDTH,
             label_gap: DEFAULT_LABEL_GAP,
             id: caller_id(),
+            interactive: true,
             frame: None,
             hover: None,
         }
@@ -175,6 +177,19 @@ impl<T> SankeyChart<T> {
     /// state and one path cache. The id must be unique among those siblings.
     pub fn id(mut self, id: impl Into<ElementId>) -> Self {
         self.id = id.into();
+        self
+    }
+
+    /// Turn this chart's interactive layer on or off. On by default.
+    ///
+    /// The layer is the hitbox under the cursor and what it drives: the hovered
+    /// node's links stand out from the rest, and a tooltip shows its label and
+    /// throughput. Turn it off for a chart that only decorates, or one an element
+    /// above it wants the cursor for: without a hitbox it neither answers the
+    /// mouse nor takes the hover from what sits over it. A chart that is off also
+    /// drops its path cache, which is keyed on the same id.
+    pub fn interactive(mut self, interactive: bool) -> Self {
+        self.interactive = interactive;
         self
     }
 
@@ -481,20 +496,26 @@ impl<T> Plot for SankeyChart<T> {
 
         let node_labels = self.node_labels(cx);
 
-        // The chart's own id is on the stack, so this cache belongs to it alone:
-        // the placement survives every frame that did not move it.
-        let key = self.frame_key(bounds, &node_labels);
-        let cache = window.use_keyed_state("sankey-frame", cx, |_, _| SankeyFrameCache::default());
-        let cached = cache.read(cx);
-        self.frame = if cached.key == Some(key) {
-            cached.frame.clone()
+        // Caching hangs off the chart's own id, which only an interactive chart
+        // puts on the stack; without one, siblings would share a slot and thrash
+        // it, so a chart that is off places itself afresh each paint.
+        self.frame = if self.interactive {
+            let key = self.frame_key(bounds, &node_labels);
+            let cache =
+                window.use_keyed_state("sankey-frame", cx, |_, _| SankeyFrameCache::default());
+            let cached = cache.read(cx);
+            if cached.key == Some(key) {
+                cached.frame.clone()
+            } else {
+                let frame = self.place(bounds, node_labels, window).map(Rc::new);
+                cache.update(cx, |cache, _| {
+                    cache.key = Some(key);
+                    cache.frame = frame.clone();
+                });
+                frame
+            }
         } else {
-            let frame = self.place(bounds, node_labels, window).map(Rc::new);
-            cache.update(cx, |cache, _| {
-                cache.key = Some(key);
-                cache.frame = frame.clone();
-            });
-            frame
+            self.place(bounds, node_labels, window).map(Rc::new)
         };
 
         vec![]
@@ -636,7 +657,7 @@ impl<T> Plot for SankeyChart<T> {
     }
 
     fn id(&self) -> Option<ElementId> {
-        Some(self.id.clone())
+        self.interactive.then(|| self.id.clone())
     }
 
     fn tooltip_state(

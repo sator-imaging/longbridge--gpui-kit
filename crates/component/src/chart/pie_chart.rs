@@ -52,7 +52,10 @@ pub struct PieChart<T: 'static> {
     label_line_color: Option<Rc<dyn Fn(&T) -> Hsla + 'static>>,
     label_color: Option<Hsla>,
     label_gap: f32,
+    tooltip_title: Option<Rc<dyn Fn(&T) -> SharedString + 'static>>,
+    value_label: Option<Rc<dyn Fn(&T, f32, f32) -> SharedString + 'static>>,
     id: ElementId,
+    interactive: bool,
     name: Option<SharedString>,
     hover: Option<PieHover>,
 }
@@ -76,7 +79,10 @@ impl<T> PieChart<T> {
             label_line_color: None,
             label_color: None,
             label_gap: DEFAULT_LABEL_GAP,
+            tooltip_title: None,
+            value_label: None,
             id: caller_id(),
+            interactive: true,
             name: None,
             hover: None,
         }
@@ -90,6 +96,19 @@ impl<T> PieChart<T> {
     /// state and one path cache. The id must be unique among those siblings.
     pub fn id(mut self, id: impl Into<ElementId>) -> Self {
         self.id = id.into();
+        self
+    }
+
+    /// Turn this chart's interactive layer on or off. On by default.
+    ///
+    /// The layer is the hitbox under the cursor and what it drives: the hovered
+    /// slice lifts out of the ring, and a tooltip shows its value and share. Turn
+    /// it off for a chart that only decorates, or one an element above it wants
+    /// the cursor for: without a hitbox it neither answers the mouse nor takes
+    /// the hover from what sits over it. A chart that is off also drops its path
+    /// cache, which is keyed on the same id.
+    pub fn interactive(mut self, interactive: bool) -> Self {
+        self.interactive = interactive;
         self
     }
 
@@ -196,6 +215,31 @@ impl<T> PieChart<T> {
         self
     }
 
+    /// Set the hover tooltip's title, naming the slice under the cursor.
+    ///
+    /// `label` supplies the title when this is unset, but it also draws the
+    /// leader-line labels around the ring — so a chart that names its slices in
+    /// a legend beside it, rather than on the ring, has no way to say which
+    /// slice the tooltip is about without this.
+    pub fn tooltip_title(mut self, title: impl Fn(&T) -> SharedString + 'static) -> Self {
+        self.tooltip_title = Some(Rc::new(title));
+        self
+    }
+
+    /// Format the value shown in the hover tooltip's row. Defaults to the raw
+    /// value followed by the share in parentheses.
+    ///
+    /// The closure receives the datum, the value `value` returned for it, and
+    /// that value's share of the total as a percentage. Set it wherever the raw
+    /// number is not what a reader should see: a value that is already a ratio
+    /// reads as `0.35 (35.0%)` by default, and a chart drawn from adjusted
+    /// values — a floor that keeps a hairline slice visible, say — would report
+    /// the adjustment as though it were the datum.
+    pub fn value_label(mut self, label: impl Fn(&T, f32, f32) -> SharedString + 'static) -> Self {
+        self.value_label = Some(Rc::new(label));
+        self
+    }
+
     /// The outer radius the ring is laid out with: the set one, or 40% of the
     /// bounds height.
     fn resolve_outer_radius(&self, bounds: &Bounds<Pixels>) -> f32 {
@@ -250,26 +294,39 @@ impl<T> Plot for PieChart<T> {
             .outer_radius(outer_radius);
         let arcs = self.arcs();
 
-        // The chart's own id is on the stack, so this cache belongs to it alone:
-        // the tessellation survives every frame that did not move it.
-        let caches = PathCaches::for_paint("slices", window, cx);
+        // Caching hangs off the chart's own id, which only an interactive chart
+        // puts on the stack; without one, siblings would share a slot and thrash
+        // it, so a chart that is off tessellates afresh each paint.
+        let caches = self
+            .interactive
+            .then(|| PathCaches::for_paint("slices", window, cx));
         for (ix, a) in arcs.iter().enumerate() {
             let inner_radius = self.get_inner_radius(a);
             // The hovered slice lifts out of the ring while the others fade behind it.
             let (lift, opacity) = self.slice_emphasis(a.index);
             let slice_radius = self.get_outer_radius(a, outer_radius) + HOVER_LIFT * lift;
             let color = self.slice_color(a.data, cx).opacity(opacity);
-            caches.update(cx, |caches, _| {
-                arc.paint_cached(
+            match caches.as_ref() {
+                Some(caches) => caches.update(cx, |caches, _| {
+                    arc.paint_cached(
+                        a,
+                        color,
+                        Some(inner_radius),
+                        Some(slice_radius),
+                        &bounds,
+                        caches.slot(ix),
+                        window,
+                    );
+                }),
+                None => arc.paint(
                     a,
                     color,
                     Some(inner_radius),
                     Some(slice_radius),
                     &bounds,
-                    caches.slot(ix),
                     window,
-                );
-            });
+                ),
+            }
         }
 
         // Draw leader-line labels outside the ring (only when `label` is set).
@@ -366,7 +423,7 @@ impl<T> Plot for PieChart<T> {
     }
 
     fn id(&self) -> Option<ElementId> {
-        Some(self.id.clone())
+        self.interactive.then(|| self.id.clone())
     }
 
     fn tooltip_state(
@@ -445,11 +502,17 @@ impl<T> Plot for PieChart<T> {
             // Follow the cursor; the lifted slice marks the datum.
             Tooltip::new(cursor, bounds.size)
                 .gap(px(8.))
-                .when_some(self.label.as_ref(), |this, label| this.title(label(d)))
+                .when_some(
+                    self.tooltip_title.as_ref().or(self.label.as_ref()),
+                    |this, title| this.title(title(d)),
+                )
                 .row(
                     self.slice_color(d, cx),
                     name,
-                    format!("{} ({:.1}%)", value, share),
+                    match self.value_label.as_ref() {
+                        Some(value_label) => value_label(d, value, share),
+                        None => format!("{value} ({share:.1}%)").into(),
+                    },
                 )
                 .into_any_element(),
         )
@@ -546,5 +609,20 @@ mod tests {
         let arcs = chart.arcs();
         assert_eq!(chart.get_outer_radius(&arcs[0], ring), 10.);
         assert_eq!(chart.get_outer_radius(&arcs[1], ring), 11.);
+    }
+
+    /// `label` draws the leader lines around the ring as well as titling the
+    /// tooltip, so a pie that names its slices in a legend beside it needs a
+    /// title it can set without putting labels on the ring.
+    #[test]
+    fn test_tooltip_title_does_not_turn_on_leader_lines() {
+        let titled = PieChart::new(vec![1f32]).tooltip_title(|_| "Tech".into());
+        assert!(titled.tooltip_title.is_some());
+        assert!(titled.label.is_none());
+
+        // `label` still titles the tooltip when no title is set.
+        let labelled = PieChart::new(vec![1f32]).label(|_| "Tech".into());
+        assert!(labelled.tooltip_title.is_none());
+        assert!(labelled.label.is_some());
     }
 }
