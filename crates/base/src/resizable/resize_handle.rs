@@ -2,8 +2,8 @@ use std::{cell::Cell, rc::Rc};
 
 use gpui::{
     AnyElement, App, Axis, Element, ElementId, Entity, GlobalElementId, InteractiveElement,
-    IntoElement, MouseDownEvent, MouseUpEvent, ParentElement as _, Pixels, Point, Render,
-    StatefulInteractiveElement, Styled as _, Window, div, prelude::FluentBuilder as _, px,
+    IntoElement, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _, Pixels, Point,
+    Render, StatefulInteractiveElement, Styled as _, Window, div, prelude::FluentBuilder as _, px,
 };
 
 use crate::{AxisExt as _, Side, theme::ActiveTheme as _};
@@ -33,7 +33,7 @@ pub type ResizeHandleRenderer =
 /// renderer only supplies what is painted inside it.
 pub struct ResizeHandleContext {
     axis: Axis,
-    active: bool,
+    state: ResizeHandleState,
 }
 
 impl ResizeHandleContext {
@@ -43,9 +43,40 @@ impl ResizeHandleContext {
         self.axis
     }
 
-    /// Whether this handle is the one being dragged right now.
+    /// Whether the pointer currently owns this handle.
     pub fn is_active(&self) -> bool {
-        self.active
+        self.state.is_active()
+    }
+
+    /// How far the pointer has gone with this handle.
+    pub fn state(&self) -> ResizeHandleState {
+        self.state
+    }
+}
+
+/// How far the pointer has gone with a resize handle.
+///
+/// A drag takes the pointer out of the handle's own band within a pixel or
+/// two, so GPUI's hover reads false for most of a drag and cannot stand in for
+/// `Dragging`. Base tracks the progression instead, and a renderer reads it
+/// through [`ResizeHandleContext::state`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ResizeHandleState {
+    /// The pointer is somewhere else.
+    #[default]
+    Idle,
+    /// The pointer is over the handle's band.
+    Hovered,
+    /// The pointer went down on the handle and has not moved since.
+    Pressed,
+    /// The handle is being dragged.
+    Dragging,
+}
+
+impl ResizeHandleState {
+    /// Whether the pointer owns the handle -- pressed on it, or dragging it.
+    pub fn is_active(self) -> bool {
+        matches!(self, Self::Pressed | Self::Dragging)
     }
 }
 
@@ -97,18 +128,29 @@ impl<T: 'static, E: 'static + Render> ResizeHandle<T, E> {
     }
 }
 
+/// One handle's [`ResizeHandleState`], shared between the element and the
+/// mouse listeners it registers.
+///
+/// The `Rc` is load-bearing. `with_element_state` hands back a clone and a
+/// bare `Cell` clones by value, so a listener holding one wrote its progress
+/// into a copy that died with the event: the stored state never left `Idle`
+/// and `is_active` never once read true.
 #[derive(Default, Debug, Clone)]
-struct ResizeHandleState {
-    active: Cell<bool>,
+struct SharedHandleState {
+    state: Rc<Cell<ResizeHandleState>>,
 }
 
-impl ResizeHandleState {
-    fn set_active(&self, active: bool) {
-        self.active.set(active);
+impl SharedHandleState {
+    fn get(&self) -> ResizeHandleState {
+        self.state.get()
     }
 
-    fn is_active(&self) -> bool {
-        self.active.get()
+    /// Reports whether the state actually changed, so a listener repaints the
+    /// window only when there is something new to paint.
+    fn set(&self, state: ResizeHandleState) -> bool {
+        let changed = self.state.get() != state;
+        self.state.set(state);
+        changed
     }
 }
 
@@ -142,9 +184,9 @@ impl<T: 'static, E: 'static + Render> Element for ResizeHandle<T, E> {
         let axis = self.axis;
 
         window.with_element_state(id.unwrap(), |state, window| {
-            let state = state.unwrap_or(ResizeHandleState::default());
+            let state: SharedHandleState = state.unwrap_or_default();
 
-            let bg_color = handle_color(&cx.theme(), state.is_active());
+            let bg_color = handle_color(&cx.theme(), state.get().is_active());
 
             let mut el = div()
                 .id(self.id.clone())
@@ -197,7 +239,7 @@ impl<T: 'static, E: 'static + Render> Element for ResizeHandle<T, E> {
                             appearance(
                                 &ResizeHandleContext {
                                     axis,
-                                    active: state.is_active(),
+                                    state: state.get(),
                                 },
                                 window,
                                 cx,
@@ -248,14 +290,16 @@ impl<T: 'static, E: 'static + Render> Element for ResizeHandle<T, E> {
     ) {
         request_layout.paint(window, cx);
 
-        window.with_element_state(id.unwrap(), |state: Option<ResizeHandleState>, window| {
-            let state = state.unwrap_or(ResizeHandleState::default());
+        window.with_element_state(id.unwrap(), |state: Option<SharedHandleState>, window| {
+            let state = state.unwrap_or_default();
 
             window.on_mouse_event({
                 let state = state.clone();
                 move |ev: &MouseDownEvent, phase, window, _| {
-                    if bounds.contains(&ev.position) && phase.bubble() {
-                        state.set_active(true);
+                    if bounds.contains(&ev.position)
+                        && phase.bubble()
+                        && state.set(ResizeHandleState::Pressed)
+                    {
                         window.refresh();
                     }
                 }
@@ -263,9 +307,42 @@ impl<T: 'static, E: 'static + Render> Element for ResizeHandle<T, E> {
 
             window.on_mouse_event({
                 let state = state.clone();
-                move |_: &MouseUpEvent, _, window, _| {
-                    if state.is_active() {
-                        state.set_active(false);
+                move |ev: &MouseMoveEvent, phase, window, _| {
+                    if !phase.bubble() {
+                        return;
+                    }
+
+                    // A press that moves is a drag, and stays one until the
+                    // button comes back up: by the second frame the pointer is
+                    // outside this nine-pixel band, so where it is says nothing
+                    // about whether the handle is still being dragged.
+                    let next = match state.get() {
+                        engaged if engaged.is_active() => ResizeHandleState::Dragging,
+                        _ if bounds.contains(&ev.position) => ResizeHandleState::Hovered,
+                        _ => ResizeHandleState::Idle,
+                    };
+                    if state.set(next) {
+                        window.refresh();
+                    }
+                }
+            });
+
+            window.on_mouse_event({
+                let state = state.clone();
+                move |ev: &MouseUpEvent, _, window, _| {
+                    if !state.get().is_active() {
+                        return;
+                    }
+
+                    // Releasing over the handle leaves it hovered. Going
+                    // straight to idle there would drop the indicator for one
+                    // frame and bring it back under a pointer that never left.
+                    let next = if bounds.contains(&ev.position) {
+                        ResizeHandleState::Hovered
+                    } else {
+                        ResizeHandleState::Idle
+                    };
+                    if state.set(next) {
                         window.refresh();
                     }
                 }
@@ -298,8 +375,39 @@ pub(crate) fn handle_color(theme: &crate::Theme, active: bool) -> gpui::Hsla {
 mod tests {
     use gpui::{TestAppContext, hsla};
 
-    use super::handle_color;
+    use super::{ResizeHandleState, SharedHandleState, handle_color};
     use crate::{ResizableTheme, Theme};
+
+    #[test]
+    fn a_listener_writes_its_progress_back_into_the_stored_state() {
+        let stored = SharedHandleState::default();
+        // What `paint` hands each mouse listener.
+        let listener = stored.clone();
+
+        assert!(listener.set(ResizeHandleState::Pressed));
+
+        // The regression this pins down: the state used to be a bare `Cell`,
+        // which clones by value, so a listener wrote into a copy that died
+        // with the event and the handle never left `Idle`.
+        assert_eq!(stored.get(), ResizeHandleState::Pressed);
+        assert!(stored.get().is_active());
+    }
+
+    #[test]
+    fn setting_the_state_it_already_has_asks_for_no_repaint() {
+        let state = SharedHandleState::default();
+
+        assert!(state.set(ResizeHandleState::Hovered));
+        assert!(!state.set(ResizeHandleState::Hovered));
+    }
+
+    #[test]
+    fn only_a_held_handle_is_active() {
+        assert!(!ResizeHandleState::Idle.is_active());
+        assert!(!ResizeHandleState::Hovered.is_active());
+        assert!(ResizeHandleState::Pressed.is_active());
+        assert!(ResizeHandleState::Dragging.is_active());
+    }
 
     #[gpui::test]
     fn an_unprojected_handle_resolves_from_the_theme_tokens(cx: &mut TestAppContext) {

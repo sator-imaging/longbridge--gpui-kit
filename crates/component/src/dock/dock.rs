@@ -8,9 +8,12 @@ use gpui::{
     IntoElement, MouseMoveEvent, MouseUpEvent, ParentElement as _, Pixels, Render, Stateful, Style,
     Styled as _, Window, div, prelude::FluentBuilder as _,
 };
-use gpui_base::dock::{
-    DockAreaRenderer, DockContext, DockEvent, DockPlacement, NodeId, PanelState, PanelView,
-    TabGroupRenderer,
+use gpui_base::{
+    ResizeHandleContext,
+    dock::{
+        DockAreaRenderer, DockContext, DockEvent, DockPlacement, NodeId, PanelState, PanelView,
+        TabGroupRenderer,
+    },
 };
 
 use crate::{
@@ -18,6 +21,7 @@ use crate::{
     dock::{
         DockSkin, SkinShared, invalid_panel::InvalidPanel, panel_handle, tab_panel::TabGroupSkin,
     },
+    resizable::{render_resize_handle, resize_handle_appearance},
     resize_handle,
 };
 
@@ -42,6 +46,15 @@ impl DockAreaRenderer for DockSkin {
 
     fn center_frame(&self, _: &mut Window, _: &mut App) -> Stateful<Div> {
         div().id("dock-area-center")
+    }
+
+    fn render_split_handle(
+        &self,
+        handle: &ResizeHandleContext,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<AnyElement> {
+        Some(render_resize_handle(handle, window, cx))
     }
 
     fn split_frame(&self, node: NodeId, _: Axis, _: &mut Window, cx: &mut App) -> Stateful<Div> {
@@ -119,6 +132,7 @@ impl DockSkin {
         };
 
         resize_handle(id, placement.axis())
+            .with_appearance(resize_handle_appearance())
             .when(placement.is_left(), |this| this.placement(Side::Left))
             .on_drag(ResizePanel, move |info, _, _, cx| {
                 cx.stop_propagation();

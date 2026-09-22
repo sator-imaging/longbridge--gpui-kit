@@ -148,7 +148,7 @@ pub use reduce_motion::apply_system_reduce_motion;
 pub use resizable::{PANEL_MIN_SIZE, resize_handle};
 pub use resizable::{
     ResizablePanel, ResizablePanelEvent, ResizablePanelGroup, ResizableState, ResizeHandleContext,
-    ResizeHandleRenderer, h_resizable, resizable_panel, v_resizable,
+    ResizeHandleRenderer, ResizeHandleState, h_resizable, resizable_panel, v_resizable,
 };
 pub use scroll_bounce::{ScrollBounce, ScrollBounceMotion};
 pub use scrollable_mask::ScrollableMask;
